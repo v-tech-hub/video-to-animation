@@ -1,0 +1,14 @@
+# Local/editor
+.idea/
+.DS_Store
+**/.DS_Store
+.venv/
+__pycache__/
+*.pyc
+
+# User/source videos and generated outputs
+video/input/*.mp4
+video/output/*.mp4
+*.mp4
+!video/input/.gitkeep
+!video/output/.gitkeep

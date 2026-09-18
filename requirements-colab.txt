@@ -1,0 +1,3 @@
+numpy<2.4
+opencv-python-headless>=4.10
+onnxruntime-gpu>=1.20
