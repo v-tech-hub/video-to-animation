@@ -99,7 +99,10 @@ def run(args):
     print(f"[4/8] Creating ONNX session with: {providers}", flush=True)
     t_session = time.perf_counter()
     session = ort.InferenceSession(str(model), providers=providers)
-    print(f"[5/8] Session ready in {time.perf_counter()-t_session:.2f}s | active: {session.get_providers()}", flush=True)
+    active_providers = session.get_providers()
+    print(f"[5/8] Session ready in {time.perf_counter()-t_session:.2f}s | active: {active_providers}", flush=True)
+    if "CUDAExecutionProvider" in available and "CUDAExecutionProvider" not in active_providers:
+        raise RuntimeError("CUDAExecutionProvider was advertised but failed to initialize. Refusing to silently run the full video on CPU.")
 
     print("[6/8] Reading first frame...", flush=True)
     ok, first_frame = cap.read()
