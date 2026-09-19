@@ -1,5 +1,7 @@
 import argparse,subprocess
 import os
+import sys
+import time
 import cv2
 from PIL import Image
 from tqdm import tqdm
@@ -34,6 +36,8 @@ class Videocap:
         self.total = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = vid.get(cv2.CAP_PROP_FPS)
         self.ori_width, self.ori_height = width, height
+        if not vid.isOpened() or width <= 0 or height <= 0 or self.total <= 0:
+            raise RuntimeError(f"Could not open video or read metadata: {video}")
 
         max_edge = max(width, height)
         # Prevent GPU memory from overflowing due to excessive input size.
@@ -41,6 +45,8 @@ class Videocap:
         height = int(round(height * scale_factor))
         width = int(round(width * scale_factor))
         self.width, self.height = self.to_8s(width), self.to_8s(height)
+        print(f"[video] source={self.ori_width}x{self.ori_height} fps={self.fps:.3f} frames={self.total}", flush=True)
+        print(f"[video] inference={self.width}x{self.height} (max edge limit={limit})", flush=True)
 
         self.count = 0  # Records the number of frames entered into the queue.
         self.cap = vid
@@ -82,13 +88,27 @@ class Videocap:
 class Cartoonizer():
     def __init__(self, arg):
         self.args = arg
-        if ort.get_device() == 'GPU' and self.args.device=="gpu" :
-            self.sess_land = ort.InferenceSession(self.args.model_path, providers = ['CUDAExecutionProvider',])
-        elif ort.get_device() == 'trt':
-            self.sess_land = ort.InferenceSession(self.args.model_path, providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider',])
+        available = ort.get_available_providers()
+        print(f"[ort] version={ort.__version__} device={ort.get_device()}", flush=True)
+        print(f"[ort] available providers={available}", flush=True)
+        if self.args.device == "gpu":
+            if 'CUDAExecutionProvider' not in available:
+                raise RuntimeError("GPU requested but CUDAExecutionProvider is unavailable; refusing CPU fallback.")
+            requested = ['CUDAExecutionProvider']
+        elif self.args.device == "trt":
+            if 'TensorrtExecutionProvider' not in available:
+                raise RuntimeError("TensorRT requested but TensorrtExecutionProvider is unavailable.")
+            requested = ['TensorrtExecutionProvider', 'CUDAExecutionProvider']
         else:
-            self.sess_land = ort.InferenceSession(self.args.model_path, providers = ['CPUExecutionProvider',])
-        self.name = os.path.basename( self.args.model_path).rsplit('.',1)[0]
+            requested = ['CPUExecutionProvider']
+        print(f"[ort] requested providers={requested}", flush=True)
+        t0 = time.perf_counter()
+        self.sess_land = ort.InferenceSession(self.args.model_path, providers=requested)
+        print(f"[ort] active providers={self.sess_land.get_providers()}", flush=True)
+        print(f"[ort] session init={time.perf_counter()-t0:.2f}s", flush=True)
+        if self.args.device == "gpu" and self.sess_land.get_providers()[0] != 'CUDAExecutionProvider':
+            raise RuntimeError(f"CUDA session was not activated: {self.sess_land.get_providers()}")
+        self.name = os.path.basename(self.args.model_path).rsplit('.',1)[0]
 
 
     def post_precess(self, img, wh):
@@ -113,7 +133,10 @@ class Cartoonizer():
         else:
             self.video_out = cv2.VideoWriter(ouput_video_path, cv2.VideoWriter_fourcc(*'mp4v'), vid.fps, (vid.ori_width, vid.ori_height))
         # self.video_out = cv2.VideoWriter(ouput_video_path, codec, vid.fps, (vid.ori_width, vid.ori_height))
-        pbar = tqdm(total=vid.total, )
+        print(f"[output] temp video={ouput_video_path}", flush=True)
+        print("[render] starting frame inference...", flush=True)
+        render_start = time.perf_counter()
+        pbar = tqdm(total=vid.total, mininterval=1.0, file=sys.stdout)
         pbar.set_description(f"Running: {os.path.basename(self.args.input_video_path).rsplit('.', 1)[0] + f'_{self.name}.mp4'}")
         while num>0:
             if vid.count < vid.total and vid.ret == False and vid.q.empty():
@@ -132,14 +155,18 @@ class Cartoonizer():
             num-=1
         pbar.close()
         self.video_out.release()
+        render_elapsed = time.perf_counter() - render_start
+        print(f"[render] frames={vid.total} elapsed={render_elapsed:.2f}s throughput={vid.total/render_elapsed:.2f} FPS", flush=True)
+        print("[audio] muxing source audio with rendered video...", flush=True)
         try:
             command = ["ffmpeg", "-loglevel", "error", "-i", self.args.input_video_path, "-y", f"{os.path.join(self.args.output,'sound.mp3')}"]
             r = subprocess.check_call(command) # Get the audio of the input video (MP3)
             command = ["ffmpeg", "-loglevel", "error", "-i", f"{os.path.join(self.args.output,'sound.mp3')}", "-i", ouput_video_path, "-y", "-c:v", "libx264", "-c:a", "copy", "-crf", "25", ouput_videoSounds_path]
             r = subprocess.check_call(command) # Merge the output video with the sound to get the final result
+            print(f"[audio] final video={ouput_videoSounds_path}", flush=True)
             return ouput_videoSounds_path
-        except:
-            print("ffmpeg fails to obtain audio, generating silent video.")
+        except Exception as exc:
+            print(f"[audio] ffmpeg failed ({exc}); keeping silent video.", flush=True)
             return ouput_video_path
 
 
