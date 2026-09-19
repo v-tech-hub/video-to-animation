@@ -127,13 +127,24 @@ class Cartoonizer():
         ouput_videoSounds_path = os.path.join(self.args.output, os.path.basename(self.args.input_video_path).rsplit('.', 1)[0] + f'_{self.name}_sounds.mp4')
 
         if self.args.IfConcat == "Horizontal":
-            self.video_out = cv2.VideoWriter(ouput_video_path, cv2.VideoWriter_fourcc(*'mp4v'), vid.fps, (vid.ori_width * 2, vid.ori_height))
+            output_size = (vid.ori_width * 2, vid.ori_height)
         elif self.args.IfConcat == "Vertical":
-            self.video_out = cv2.VideoWriter(ouput_video_path, cv2.VideoWriter_fourcc(*'mp4v'), vid.fps, (vid.ori_width, vid.ori_height * 2))
+            output_size = (vid.ori_width, vid.ori_height * 2)
         else:
-            self.video_out = cv2.VideoWriter(ouput_video_path, cv2.VideoWriter_fourcc(*'mp4v'), vid.fps, (vid.ori_width, vid.ori_height))
-        # self.video_out = cv2.VideoWriter(ouput_video_path, codec, vid.fps, (vid.ori_width, vid.ori_height))
-        print(f"[output] temp video={ouput_video_path}", flush=True)
+            output_size = (vid.ori_width, vid.ori_height)
+
+        # Write frames to AVI/MJPEG first. OpenCV's mp4v writer can leave an MP4
+        # without a moov atom in Colab, producing a large but unplayable file.
+        temp_avi_path = os.path.join(
+            self.args.output,
+            os.path.basename(self.args.input_video_path).rsplit('.', 1)[0] + f'_{self.name}_frames.avi'
+        )
+        self.video_out = cv2.VideoWriter(
+            temp_avi_path, cv2.VideoWriter_fourcc(*'MJPG'), vid.fps, output_size
+        )
+        if not self.video_out.isOpened():
+            raise RuntimeError(f"Could not open VideoWriter for {temp_avi_path}")
+        print(f"[output] frame container={temp_avi_path} codec=MJPEG", flush=True)
         print("[render] starting frame inference...", flush=True)
         render_start = time.perf_counter()
         preprocess_wait_s = 0.0
@@ -169,6 +180,24 @@ class Cartoonizer():
             num-=1
         pbar.close()
         self.video_out.release()
+
+        # Finalize a standards-compliant H.264 MP4 after all frames are safely closed.
+        print("[output] encoding H.264 MP4...", flush=True)
+        encode = subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", temp_avi_path,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-an", ouput_video_path
+        ], capture_output=True, text=True)
+        if encode.returncode != 0:
+            raise RuntimeError(f"ffmpeg H.264 encode failed: {encode.stderr.strip()}")
+        try:
+            os.remove(temp_avi_path)
+        except OSError:
+            pass
+        print(f"[output] H.264 video={ouput_video_path}", flush=True)
+
         render_elapsed = time.perf_counter() - render_start
         print(f"[render] frames={vid.total} elapsed={render_elapsed:.2f}s throughput={vid.total/render_elapsed:.2f} FPS", flush=True)
         measured = preprocess_wait_s + inference_s + postprocess_s + write_s
