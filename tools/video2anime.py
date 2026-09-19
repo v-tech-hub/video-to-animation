@@ -136,6 +136,10 @@ class Cartoonizer():
         print(f"[output] temp video={ouput_video_path}", flush=True)
         print("[render] starting frame inference...", flush=True)
         render_start = time.perf_counter()
+        preprocess_wait_s = 0.0
+        inference_s = 0.0
+        postprocess_s = 0.0
+        write_s = 0.0
         pbar = tqdm(total=vid.total, mininterval=1.0, file=sys.stdout)
         pbar.set_description(f"Running: {os.path.basename(self.args.input_video_path).rsplit('.', 1)[0] + f'_{self.name}.mp4'}")
         while num>0:
@@ -143,30 +147,70 @@ class Cartoonizer():
                 pbar.close()
                 self.video_out.release()
                 return "The video is broken, please upload the video again."
+            t = time.perf_counter()
             frame = vid.read()
+            preprocess_wait_s += time.perf_counter() - t
+
+            t = time.perf_counter()
             fake_img = self.sess_land.run(None, {self.sess_land.get_inputs()[0].name: frame})[0]
+            inference_s += time.perf_counter() - t
+
+            t = time.perf_counter()
             fake_img = self.post_precess(fake_img, (vid.ori_width, vid.ori_height))
             if self.args.IfConcat == "Horizontal":
                 fake_img = np.hstack((self.post_precess(frame, (vid.ori_width, vid.ori_height)), fake_img))
             elif self.args.IfConcat == "Vertical":
                 fake_img = np.vstack((self.post_precess(frame, (vid.ori_width, vid.ori_height)), fake_img))
+            postprocess_s += time.perf_counter() - t
+            t = time.perf_counter()
             self.video_out.write(fake_img[:,:,::-1])
+            write_s += time.perf_counter() - t
             pbar.update(1)
             num-=1
         pbar.close()
         self.video_out.release()
         render_elapsed = time.perf_counter() - render_start
         print(f"[render] frames={vid.total} elapsed={render_elapsed:.2f}s throughput={vid.total/render_elapsed:.2f} FPS", flush=True)
-        print("[audio] muxing source audio with rendered video...", flush=True)
+        measured = preprocess_wait_s + inference_s + postprocess_s + write_s
+        print("[profile] stage breakdown:", flush=True)
+        for label, value in [
+            ("preprocess/wait", preprocess_wait_s),
+            ("onnx inference", inference_s),
+            ("postprocess", postprocess_s),
+            ("video write", write_s),
+        ]:
+            pct = (value / render_elapsed * 100.0) if render_elapsed else 0.0
+            per_frame = (value / vid.total * 1000.0) if vid.total else 0.0
+            print(f"[profile] {label:15s} {value:8.2f}s  {pct:5.1f}%  {per_frame:7.2f} ms/frame", flush=True)
+        other = max(0.0, render_elapsed - measured)
+        print(f"[profile] {'other/overlap':15s} {other:8.2f}s  {(other/render_elapsed*100.0 if render_elapsed else 0):5.1f}%", flush=True)
+
+        # Probe first. Silent source videos are normal and should not produce an ffmpeg error.
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=index", "-of", "csv=p=0", self.args.input_video_path],
+            capture_output=True, text=True
+        )
+        if probe.returncode != 0:
+            print(f"[audio] ffprobe failed; keeping silent video: {probe.stderr.strip()}", flush=True)
+            return ouput_video_path
+        if not probe.stdout.strip():
+            print("[audio] source has no audio stream; keeping silent video.", flush=True)
+            return ouput_video_path
+
+        print("[audio] audio stream detected; muxing without intermediate MP3...", flush=True)
         try:
-            command = ["ffmpeg", "-loglevel", "error", "-i", self.args.input_video_path, "-y", f"{os.path.join(self.args.output,'sound.mp3')}"]
-            r = subprocess.check_call(command) # Get the audio of the input video (MP3)
-            command = ["ffmpeg", "-loglevel", "error", "-i", f"{os.path.join(self.args.output,'sound.mp3')}", "-i", ouput_video_path, "-y", "-c:v", "libx264", "-c:a", "copy", "-crf", "25", ouput_videoSounds_path]
-            r = subprocess.check_call(command) # Merge the output video with the sound to get the final result
+            command = [
+                "ffmpeg", "-loglevel", "error", "-i", ouput_video_path,
+                "-i", self.args.input_video_path, "-y",
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-shortest", ouput_videoSounds_path
+            ]
+            subprocess.check_call(command)
             print(f"[audio] final video={ouput_videoSounds_path}", flush=True)
             return ouput_videoSounds_path
         except Exception as exc:
-            print(f"[audio] ffmpeg failed ({exc}); keeping silent video.", flush=True)
+            print(f"[audio] mux failed ({exc}); keeping silent video.", flush=True)
             return ouput_video_path
 
 
